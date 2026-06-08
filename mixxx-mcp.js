@@ -1,22 +1,22 @@
 /**
- * mixxx-mcp.js — Companion Mixxx Controller Script
- * 
- * Drop this file into: ~/Library/Containers/org.mixxx.mixxx/Data/Library/
- *                       Application Support/Mixxx/controllers/     (macOS)
- *                    or ~/.mixxx/controllers/                       (Linux/Windows)
- * 
- * Then load the accompanying mixxx-mcp.midi.xml preset in:
- *   Mixxx → Preferences → Controllers
- * 
- * This script:
- *   1. Receives MIDI CC from the mixxx-mcp Python server (virtual MIDI port)
- *   2. Routes CC → engine.setValue([Group], key, normalizedValue)
- *   3. Forwards control changes back via OSC to the MCP state store
+ * mixxx-mcp.js — Mixxx Controller Script v1.1.0
  *
- * Compatible with Mixxx 2.4+ (ES7, QJSEngine)
+ * Bridges Mixxx ControlObjects ↔ mixxx-mcp Python server via:
+ *   WRITE:  Python → MIDI CC → this script → engine.setValue()
+ *   READ:   engine.makeConnection() → XHR POST → Python state server
+ *
+ * Compatible: Mixxx 2.4+ (ES7, QJSEngine, XMLHttpRequest available)
+ *
+ * Install: %LOCALAPPDATA%\Mixxx\controllers\  (Windows)
+ *          ~/.mixxx/controllers/               (Linux)
+ *          ~/Library/.../Mixxx/controllers/   (macOS)
  */
 
 "use strict";
+
+// ── Config ────────────────────────────────────────────────────────────────
+const MCP_STATE_URL = "http://127.0.0.1:57121/state";
+const MCP_DEBOUNCE_MS = 50; // min ms between XHR pushes per control
 
 // ── CC → (group, key, scale) routing table ────────────────────────────────
 const CC_ROUTE = {
@@ -102,7 +102,7 @@ const CC_ROUTE = {
     104: { group: "[EffectRack1_EffectUnit1_Effect1]", key: "enabled", scale: "binary" },
     105: { group: "[EffectRack1_EffectUnit1_Effect2]", key: "enabled", scale: "binary" },
     106: { group: "[EffectRack1_EffectUnit1_Effect3]", key: "enabled", scale: "binary" },
-    // Rate nudge (deck determined by active deck context — see _currentDeck)
+    // Rate nudge (deck-relative — uses _activeDeck)
     110: { group: null, key: "rate_perm_up_small",   scale: "binary", deckRelative: true },
     111: { group: null, key: "rate_perm_down_small", scale: "binary", deckRelative: true },
     112: { group: null, key: "rate_perm_up",         scale: "binary", deckRelative: true },
@@ -112,8 +112,8 @@ const CC_ROUTE = {
     116: { group: null, key: "beatjump_backward",    scale: "binary", deckRelative: true },
 };
 
-// Hotcue slots 3–8 for channels 1–2 (auto-generated at init)
-function _buildHotcueRoutes() {
+// Hotcue slots 3–8 for channels 1–2
+(function buildHotcueRoutes() {
     const actions = ["set", "goto", "clear"];
     for (let ch = 1; ch <= 2; ch++) {
         for (let slot = 3; slot <= 8; slot++) {
@@ -127,74 +127,122 @@ function _buildHotcueRoutes() {
             });
         }
     }
-}
+})();
 
-// ── Scale decode ──────────────────────────────────────────────────────────
+// ── Controls to watch (state push to Python) ──────────────────────────────
+const WATCH = {
+    "[Channel1]": ["play","bpm","playposition","volume","pregain","rate",
+                   "sync_enabled","loop_enabled","beatloop_size",
+                   "filterLow","filterMid","filterHigh",
+                   "track_artist","track_title","duration","track_samplerate",
+                   "hotcue_1_position","hotcue_2_position","hotcue_3_position",
+                   "hotcue_4_position"],
+    "[Channel2]": ["play","bpm","playposition","volume","pregain","rate",
+                   "sync_enabled","loop_enabled","beatloop_size",
+                   "filterLow","filterMid","filterHigh",
+                   "track_artist","track_title","duration","track_samplerate"],
+    "[Channel3]": ["play","bpm","playposition","volume","rate","sync_enabled"],
+    "[Channel4]": ["play","bpm","playposition","volume","rate","sync_enabled"],
+    "[Master]":   ["crossfader","volume","headVolume","headMix","balance"],
+    "[EffectRack1_EffectUnit1]": ["mix","enabled"],
+    "[EffectRack1_EffectUnit2]": ["mix","enabled"],
+};
+
+// ── Scale decode (MIDI 0–127 → Mixxx float) ───────────────────────────────
 function decode(midiVal, scale) {
     switch (scale) {
         case "binary":   return midiVal >= 64 ? 1.0 : 0.0;
         case "unipolar": return midiVal / 127.0;
         case "bipolar":  return (midiVal / 127.0) * 2.0 - 1.0;
         case "eq":       return (midiVal / 127.0) * 4.0;
-        case "beatloop":
-            // Map 0–127 to common beatloop sizes
+        case "beatloop": {
             const sizes = [0.03125,0.0625,0.125,0.25,0.5,1,2,4,8,16,32,64];
             return sizes[Math.round((midiVal / 127.0) * (sizes.length - 1))] || 4;
-        case "raw":      return midiVal;
-        default:         return midiVal / 127.0;
+        }
+        case "raw": return midiVal;
+        default:    return midiVal / 127.0;
     }
 }
 
-// ── Active deck tracker (for deckRelative controls) ───────────────────────
+// ── XHR state push (fire-and-forget, debounced) ───────────────────────────
+const _lastPush = {};
+
+function pushState(group, key, value) {
+    const ck = `${group}/${key}`;
+    const now = Date.now();
+    if (_lastPush[ck] && (now - _lastPush[ck]) < MCP_DEBOUNCE_MS) return;
+    _lastPush[ck] = now;
+
+    try {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", MCP_STATE_URL, true); // async
+        xhr.setRequestHeader("Content-Type", "application/json");
+        xhr.send(JSON.stringify({ group, key, value }));
+        // no response handling — fire and forget
+    } catch (e) {
+        // Python server not running — fail silently, MIDI still works
+    }
+}
+
+// ── Trigger keys (use triggerControl, not setValue) ───────────────────────
+const TRIGGER_KEYS = new Set([
+    "cue_default","beatloop_activate","reloop_toggle",
+    "loop_halve","loop_double","beatjump_forward","beatjump_backward",
+    "rate_perm_up_small","rate_perm_down_small","rate_perm_up","rate_perm_down",
+]);
+
+// ── Main controller object ────────────────────────────────────────────────
 const MixxxMCP = {
     _activeDeck: 1,
+    _connections: [],
 
     getActiveGroup() {
         return `[Channel${this._activeDeck}]`;
     },
 
-    setActiveDeck(deck) {
-        if (deck >= 1 && deck <= 4) this._activeDeck = deck;
-    },
-
-    // Called by Mixxx on script load
+    // ── Mixxx lifecycle ──────────────────────────────────────────────────
     init(id, debug) {
-        _buildHotcueRoutes();
-        console.log("[mixxx-mcp] Script initialized. Active deck:", this._activeDeck);
+        console.log("[mixxx-mcp] init — wiring state connections");
 
-        // Wire up OSC state broadcasting for key controls
-        const watchList = [
-            { groups: ["[Channel1]","[Channel2]","[Channel3]","[Channel4]"],
-              keys: ["play","bpm","playposition","volume","rate","sync_enabled",
-                     "loop_enabled","beatloop_size","track_artist","track_title","duration"] },
-            { groups: ["[Master]"],
-              keys: ["crossfader","volume","headVolume","headMix"] },
-        ];
+        // Wire live state push for all watched controls
+        for (const [grp, keys] of Object.entries(WATCH)) {
+            for (const key of keys) {
+                try {
+                    const conn = engine.makeConnection(grp, key, function(val, g, k) {
+                        pushState(g, k, val);
+                    });
+                    this._connections.push(conn);
+                } catch(e) {
+                    // Control may not exist in this Mixxx version — skip silently
+                }
+            }
+        }
 
-        watchList.forEach(({ groups, keys }) => {
-            groups.forEach(grp => {
-                keys.forEach(key => {
+        // Push initial state snapshot so Python has values immediately
+        setTimeout(() => {
+            for (const [grp, keys] of Object.entries(WATCH)) {
+                for (const key of keys) {
                     try {
-                        engine.makeConnection(grp, key, (val, grp, key) => {
-                            // The OSC send would happen here if Mixxx had native OSC output.
-                            // For now, log it so the companion OSC bridge can pick it up.
-                            // To fully enable: compile Mixxx with liblo or use an OSC plugin.
-                            console.log(`[OSC] ${grp}/${key} = ${val}`);
-                        });
-                    } catch(e) {
-                        // Key may not exist for this version of Mixxx — skip
-                    }
-                });
-            });
-        });
+                        const val = engine.getValue(grp, key);
+                        if (val !== undefined && val !== null) {
+                            pushState(grp, key, val);
+                        }
+                    } catch(e) {}
+                }
+            }
+            console.log("[mixxx-mcp] initial state snapshot pushed");
+        }, 1000);
+
+        console.log(`[mixxx-mcp] ready — ${this._connections.length} connections active`);
     },
 
-    // Called by Mixxx on script unload
     shutdown(id) {
-        console.log("[mixxx-mcp] Script shutdown");
+        this._connections.forEach(c => { try { c.disconnect(); } catch(e) {} });
+        this._connections = [];
+        console.log("[mixxx-mcp] shutdown");
     },
 
-    // Main MIDI CC handler — called for every incoming CC message
+    // ── MIDI CC handler ──────────────────────────────────────────────────
     handleCC(channel, control, value, status, group) {
         const route = CC_ROUTE[control];
         if (!route) {
@@ -203,30 +251,21 @@ const MixxxMCP = {
         }
 
         const grp = route.deckRelative ? this.getActiveGroup() : route.group;
-        const decodedVal = decode(value, route.scale);
-
-        // Trigger controls (binary pulse) use triggerControl
-        if (route.scale === "binary" && decodedVal === 1.0) {
-            const triggerKeys = [
-                "cue_default","beatloop_activate","reloop_toggle",
-                "loop_halve","loop_double","beatjump_forward","beatjump_backward",
-                "rate_perm_up_small","rate_perm_down_small","rate_perm_up","rate_perm_down",
-            ];
-            if (triggerKeys.includes(route.key)) {
-                script.triggerControl(grp, route.key, 100);
-                return;
-            }
-        }
+        const val  = decode(value, route.scale);
 
         // Hotcue triggers
-        if (route.key && route.key.match(/^hotcue_\d+_(set|goto|clear)$/)) {
-            if (decodedVal === 1.0) {
-                script.triggerControl(grp, route.key, 100);
-            }
+        if (route.key && /^hotcue_\d+_(set|goto|clear)$/.test(route.key)) {
+            if (val === 1.0) script.triggerControl(grp, route.key, 100);
             return;
         }
 
-        engine.setValue(grp, route.key, decodedVal);
-        console.log(`[mixxx-mcp] ${grp}.${route.key} = ${decodedVal} (CC ${control}=${value})`);
+        // Pulse triggers
+        if (TRIGGER_KEYS.has(route.key)) {
+            if (val === 1.0) script.triggerControl(grp, route.key, 100);
+            return;
+        }
+
+        engine.setValue(grp, route.key, val);
+        console.log(`[mixxx-mcp] SET ${grp}.${route.key} = ${val}`);
     },
 };
